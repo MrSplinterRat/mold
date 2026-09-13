@@ -113,15 +113,6 @@ InputFile<E>::InputFile(Context<E> &ctx)
     filename("<internal>") {}
 
 template <typename E>
-void InputFile<E>::populate_symbol_name_lengths() {
-  symname_lens.reserve(elf_syms.size());
-  for (const ElfSym<E> &esym : elf_syms) {
-    const char *p = symbol_strtab.data() + esym.st_name;
-    symname_lens.emplace_back(strlen(p));
-  }
-}
-
-template <typename E>
 ElfShdr<E> *InputFile<E>::find_section(i64 type) {
   for (ElfShdr<E> &sec : elf_sections)
     if (sec.sh_type == type)
@@ -314,31 +305,19 @@ void ObjectFile<E>::read_section_metadata(Context<E> &ctx) {
     if (entries[0] != GRP_COMDAT)
       Fatal(ctx) << *this << ": unsupported SHT_GROUP format";
 
-    // Ordinary global signatures already have a Symbol. Local, section and
-    // versioned signatures use the same symbol table through their full name.
+    // Ordinary global signatures already have a Symbol. The cached version
+    // flag excludes a bare trailing '@', which still needs the full name.
+    // Local and section signatures also use their full names.
     Symbol<E> *signature;
     if (esym.st_type != STT_SECTION && esym.st_bind != STB_LOCAL &&
-        !esym.is_undef() && name.find('@') == name.npos)
+        !esym.is_undef() && !has_symver[shdr.sh_info - this->first_global] &&
+        !name.ends_with('@'))
       signature = this->symbols[shdr.sh_info];
     else
       signature = get_symbol(ctx, name);
 
     comdat_groups.emplace_back(ctx, signature, i);
   }
-}
-
-// Returns the number of relocations referring to the section symbol of
-// a mergeable section. reattach_section_pieces() replaces each of them
-// with a symbol for the section piece it refers to.
-template <typename E>
-i64 ObjectFile<E>::count_frag_syms(std::span<const ElfRel<E>> rels) {
-  i64 n = 0;
-  for (const ElfRel<E> &r : rels)
-    if (const ElfSym<E> &esym = this->elf_syms[r.r_sym];
-        esym.st_type == STT_SECTION &&
-        (this->elf_sections[get_shndx(esym)].sh_flags & SHF_MERGE))
-      n++;
-  return n;
 }
 
 template <typename E>
@@ -374,23 +353,14 @@ void ObjectFile<E>::initialize_sections(Context<E> &ctx) {
     case SHT_GROUP:
       break;
     case SHT_CREL:
-      decoded_crel.resize(i + 1);
+      if (decoded_crel.empty())
+        decoded_crel.resize(this->elf_sections.size());
       if ((this->elf_sections[shdr.sh_info].sh_flags & SHF_ALLOC) ||
           ctx.arg.relocatable || ctx.arg.emit_relocs)
         decoded_crel[i] = decode_crel(ctx, *this, shdr);
-
-      // Count the relocations just decoded while they are in cache.
-      if (this->elf_sections[shdr.sh_info].sh_flags & SHF_ALLOC) {
-        std::span<const ElfRel<E>> rels(decoded_crel[i].data(), decoded_crel[i].size());
-        this->num_frag_syms += count_frag_syms(rels);
-      }
       break;
     case SHT_REL:
     case SHT_RELA:
-      if (this->elf_sections[shdr.sh_info].sh_flags & SHF_ALLOC)
-        this->num_frag_syms +=
-          count_frag_syms(this->template get_data<ElfRel<E>>(ctx, shdr));
-      break;
     case SHT_SYMTAB:
     case SHT_SYMTAB_SHNDX:
     case SHT_STRTAB:
@@ -806,12 +776,9 @@ void ObjectFile<E>::parse_sframe(Context<E> &ctx) requires supports_sframe<E> {
 
     std::string_view data = this->get_string(ctx, isec->shdr());
 
-    // Some assemblers (e.g. GNU as 2.45 on Scrt1.o) emit a placeholder
-    // SHT_GNU_SFRAME section with sh_size == 0 instead of either omitting
-    // the section or writing a valid empty header (num_fdes == 0). Treat
-    // that the same as "nothing to contribute" rather than reading past
-    // the end of the section as if it were a real header.
-    if (data.size() < sizeof(SFrameHeader<E>))
+    // GNU assembler emits an empty .sframe section for an input file that
+    // needs no unwind info (e.g. glibc's Scrt1.o assembled by gas 2.45).
+    if (data.empty())
       continue;
 
     const SFrameHeader<E> &hdr = *(const SFrameHeader<E> *)data.data();
@@ -877,6 +844,13 @@ void ObjectFile<E>::register_global_symbols(Context<E> &ctx) {
 
   this->symbols.resize(this->elf_syms.size());
 
+  // Cache local names here and global names while registering them below.
+  this->symname_lens.reserve(this->elf_syms.size());
+  for (const ElfSym<E> &esym : this->elf_syms.first(this->first_global)) {
+    const char *name = this->symbol_strtab.data() + esym.st_name;
+    this->symname_lens.emplace_back(strlen(name));
+  }
+
   i64 num_globals = this->elf_syms.size() - this->first_global;
   has_symver.resize(num_globals);
 
@@ -889,14 +863,19 @@ void ObjectFile<E>::register_global_symbols(Context<E> &ctx) {
     if (esym.is_common())
       has_common_symbol = true;
 
-    // Get a symbol name
-    std::string_view key = this->get_symbol_name(i);
-    std::string_view name = key;
+    // Find the name length and version separator in one scan.
+    const char *str = this->symbol_strtab.data() + esym.st_name;
+    i64 pos = 0;
+    while (str[pos] && str[pos] != '@')
+      pos++;
+    i64 len = pos + (str[pos] ? strlen(str + pos) : 0);
+    std::string_view key(str, len);
+    std::string_view name(str, pos);
+    this->symname_lens.emplace_back(len);
 
     // Parse symbol version after atsign
-    if (i64 pos = name.find('@'); pos != name.npos) {
-      std::string_view ver = name.substr(pos);
-      name = name.substr(0, pos);
+    if (pos != len) {
+      std::string_view ver = key.substr(pos);
 
       if (ver != "@") {
         if (ver.starts_with("@@"))
@@ -991,7 +970,8 @@ void ObjectFile<E>::sort_relocations(Context<E> &ctx) {
 }
 
 template <typename E>
-void ObjectFile<E>::convert_mergeable_sections(Context<E> &ctx) {
+void ObjectFile<E>::convert_mergeable_sections(
+  Context<E> &ctx, std::vector<MergedSection<E> *> &cache) {
   // Convert InputSections to MergeableSections
   for (i64 i = 0; i < this->sections.size(); i++) {
     InputSection<E> *isec = this->sections[i];
@@ -1003,7 +983,7 @@ void ObjectFile<E>::convert_mergeable_sections(Context<E> &ctx) {
       continue;
 
     MergedSection<E> *parent =
-      MergedSection<E>::get_instance(ctx, isec->name(), shdr);
+      MergedSection<E>::get_instance(ctx, isec->name(), shdr, &cache);
 
     if (parent) {
       std::unique_ptr<MergeableSection<E>> m =
@@ -1091,17 +1071,10 @@ void ObjectFile<E>::reattach_section_pieces(Context<E> &ctx) {
     sym.value = frag_offset;
   }
 
-  // Arena allocations cannot be reclaimed, so grow this vector only once.
-  // num_frag_syms, counted when the sections were parsed, may include
-  // references to mergeable sections that were not converted; the extra
-  // symbols stay unused.
-  this->symbols.reserve(this->symbols.size() + this->num_frag_syms);
-  this->frag_syms = allocate_symbols<E>(ctx, this->num_frag_syms);
-
   // For each relocation referring to a mergeable section symbol, we
   // create a new dummy non-section symbol and redirect the relocation
   // to the newly created symbol.
-  i64 idx = 0;
+  std::vector<Symbol<E> *> frag_syms;
   for (InputSection<E> *isec : sections) {
     if (isec && (isec->shdr().sh_flags & SHF_ALLOC)) {
       for (ElfRel<E> &r : isec->get_rels(ctx)) {
@@ -1124,23 +1097,23 @@ void ObjectFile<E>::reattach_section_pieces(Context<E> &ctx) {
         if (!frag)
           Fatal(ctx) << *this << ": bad relocation at " << r.r_sym;
 
-        Symbol<E> &sym = this->frag_syms[idx];
+        Symbol<E> &sym = *ctx.arena.template make<Symbol<E>>();
         sym.file = this;
         sym.is_fragment_dummy = true;
         sym.sym_idx = r.r_sym;
         sym.visibility = STV_HIDDEN;
         sym.set_frag(frag);
         sym.value = in_frag_offset - r_addend;
-        r.r_sym = this->elf_syms.size() + idx;
-        idx++;
+        r.r_sym = this->elf_syms.size() + frag_syms.size();
+        frag_syms.push_back(&sym);
       }
     }
   }
 
-  assert(idx == this->frag_syms.size());
-
-  for (Symbol<E> &sym : this->frag_syms)
-    this->symbols.emplace_back(&sym);
+  // Arena allocations cannot be reclaimed, so grow this vector only once.
+  this->symbols.reserve(this->symbols.size() + frag_syms.size());
+  for (Symbol<E> *sym : frag_syms)
+    this->symbols.emplace_back(sym);
 }
 
 // Read global symbols before archive extraction so they can participate in
@@ -1155,7 +1128,6 @@ void ObjectFile<E>::parse_symbols(Context<E> &ctx) {
     this->first_global = symtab_sec->sh_info;
     this->elf_syms = this->template get_data<ElfSym<E>>(ctx, *symtab_sec);
     this->symbol_strtab = this->get_string(ctx, symtab_sec->sh_link);
-    this->populate_symbol_name_lengths();
 
     if (ElfShdr<E> *shdr = this->find_section(SHT_SYMTAB_SHNDX))
       symtab_shndx_sec = this->template get_data<U32<E>>(ctx, *shdr);
@@ -1582,6 +1554,14 @@ void SharedFile<E>::parse(Context<E> &ctx) {
   if (ElfShdr<E> *sec = this->find_section(SHT_GNU_VERSYM))
     vers = this->template get_data<U16<E>>(ctx, *sec);
 
+  // Gather unversioned names in parallel, just like object-file symbols.
+  // The reservation above keeps the recorded slots stable until gather.
+  auto &bin = ctx.symbol_map.get_bin();
+  auto add_symbol = [&](std::string_view name) {
+    auto &slot = this->symbols.emplace_back(nullptr);
+    ctx.symbol_map.add(bin, name, slot);
+  };
+
   for (i64 i = symtab_sec->sh_info; i < esyms.size(); i++) {
     u16 ver = vers.empty() ? VER_NDX_GLOBAL : (vers[i] & ~VERSYM_HIDDEN);
 
@@ -1645,7 +1625,7 @@ void SharedFile<E>::parse(Context<E> &ctx) {
     // visit all symbol references to redirect `foo@VERSION` to `foo`.
     if (!has_version) {
       // Unversioned symbol
-      this->symbols.emplace_back(get_symbol(ctx, name));
+      add_symbol(name);
       this->symbols2.push_back(nullptr);
     } else if (esyms[i].is_undef() || (vers[i] & VERSYM_HIDDEN)) {
       // Versioned non-default symbol, or undefined reference whose
@@ -1654,7 +1634,7 @@ void SharedFile<E>::parse(Context<E> &ctx) {
       this->symbols2.push_back(nullptr);
     } else {
       // Versioned default symbol
-      this->symbols.emplace_back(get_symbol(ctx, name));
+      add_symbol(name);
       this->symbols2.push_back(get_versioned_sym());
     }
   }

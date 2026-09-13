@@ -959,7 +959,13 @@ public:
     }
   }
 
-  void add_symbol(Context<E> &ctx, Symbol<E> *sym);
+  void add_symbol(Context<E> &ctx, Symbol<E> *sym) {
+    assert(!sym->has_plt(ctx));
+    sym->aux->plt_idx = symbols.size();
+    symbols.push_back(sym);
+    ctx.dynsym->add_symbol(ctx, sym);
+  }
+
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
 
@@ -983,7 +989,15 @@ public:
     this->shdr.sh_addralign = 16;
   }
 
-  void add_symbol(Context<E> &ctx, Symbol<E> *sym);
+  void add_symbol(Context<E> &ctx, Symbol<E> *sym) {
+    assert(!sym->has_plt(ctx));
+    assert(sym->has_got(ctx));
+
+    sym->aux->pltgot_idx = symbols.size();
+    symbols.push_back(sym);
+    this->shdr.sh_size = symbols.size() * E::pltgot_size;
+  }
+
   void copy_buf(Context<E> &ctx) override;
 
   void compute_symtab_size(Context<E> &ctx) override;
@@ -1218,12 +1232,27 @@ public:
     this->shdr.sh_addralign = sizeof(Word<E>);
   }
 
-  void add_symbol(Context<E> &ctx, Symbol<E> *sym);
+  void add_symbol(Context<E> &ctx, Symbol<E> *sym) {
+    if (symbols.empty())
+      symbols.resize(1);
+
+    if (sym->get_dynsym_idx(ctx) == -1) {
+      sym->aux->dynsym_idx = -2;
+      symbols.push_back(sym);
+    }
+  }
+
   void update_shdr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
 
   std::vector<Symbol<E> *> symbols;
   i64 dynstr_offset = -1;
+
+  struct DynstrEntry {
+    std::string_view name;
+    i64 offset = 0;
+  };
+  std::vector<DynstrEntry> dynstr_entries;
 };
 
 // .hash contains an on-disk hash table for .dynsym so that the runtime
@@ -1288,12 +1317,14 @@ template <typename E>
 class MergedSection : public Chunk<E> {
 public:
   static MergedSection<E> *
-  get_instance(Context<E> &ctx, std::string_view name, const ElfShdr<E> &shdr);
+  get_instance(Context<E> &ctx, std::string_view name, const ElfShdr<E> &shdr,
+               std::vector<MergedSection<E> *> *cache = nullptr);
 
   SectionFragment<E> *insert(Context<E> &ctx, std::string_view data,
                              u64 hash, i64 p2align);
 
   void resolve(Context<E> &ctx);
+  void assign_offsets(Context<E> &ctx);
   void compute_section_size(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
   void write_to(Context<E> &ctx, u8 *buf) override;
@@ -1810,7 +1841,8 @@ public:
 
   void split_contents(Context<E> &ctx);
   void resolve_contents(Context<E> &ctx);
-  std::pair<SectionFragment<E> *, i64> get_fragment(i64 offset);
+  std::pair<SectionFragment<E> *, i64>
+  get_fragment(i64 offset, i64 *hint = nullptr);
   std::string_view get_contents(i64 idx);
 
   MergedSection<E> &parent;
@@ -1952,14 +1984,20 @@ public:
   std::string filename;
   bool is_dso = false;
   i64 priority;
+
+  // A file is reachable if it is to be included in the output. Files
+  // given directly on the command line are reachable from the start.
+  // Archive members and --as-needed shared libraries are `as_needed`;
+  // they become reachable when a reachable file refers to them. Symbol
+  // resolution ranks definitions in unreachable files below others, so
+  // this must be correct before the first resolution round.
   Atomic<bool> is_reachable = false;
+
   std::string_view shstrtab;
   std::string_view symbol_strtab;
 
   // Parallel to elf_syms; avoids rescanning complete symbol names.
   std::vector<NameLen> symname_lens;
-
-  void populate_symbol_name_lengths();
 
   std::string_view get_symbol_name(i64 i) const {
     const char *p = symbol_strtab.data() + elf_syms[i].st_name;
@@ -1983,8 +2021,6 @@ public:
 
 protected:
   std::span<Symbol<E>> local_syms;
-  std::span<Symbol<E>> frag_syms;
-  i64 num_frag_syms = 0;
 };
 
 template <typename E>
@@ -2021,11 +2057,11 @@ public:
   void register_global_symbols(Context<E> &ctx);
   void parse_ehframe(Context<E> &ctx);
   void parse_sframe(Context<E> &ctx) requires supports_sframe<E>;
-  void convert_mergeable_sections(Context<E> &ctx);
+  void convert_mergeable_sections(Context<E> &ctx,
+                                   std::vector<MergedSection<E> *> &cache);
   void reattach_section_pieces(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx) override;
   void resolve_symbol(Context<E> &ctx, i64 idx);
-  i64 count_frag_syms(std::span<const ElfRel<E>> rels);
   void mark_live_objects(Context<E> &ctx,
                          std::function<void(InputFile<E> *)> feeder) override;
   void convert_undefined_weak_symbols(Context<E> &ctx);
@@ -2178,9 +2214,12 @@ struct ReaderContext {
 // A file to read along with the reader state at its command line
 // position. parse_nonpositional_args() creates one ReaderJob per
 // input file argument; `name` is a path or, if `is_lib` is set, a
-// library name to search for. read_input_files() additionally
-// enqueues archive members as jobs in an already-opened form, with
-// `mf` and `archive_name` set instead.
+// library name to search for.
+//
+// read_input_files() also enqueues archive members, with `archive_name`
+// set and either `mf` for a regular archive or `name` and `thin_parent`
+// for a thin archive. Deferred IR files have `mf` set and, for archive
+// members, `archive_name`, so the LTO plugin can claim them later.
 struct ReaderJob {
   ReaderContext rctx;
   std::string name;
@@ -2392,7 +2431,6 @@ template <typename E> void compute_section_sizes(Context<E> &);
 template <typename E> void sort_output_sections(Context<E> &);
 template <typename E> void claim_unresolved_symbols(Context<E> &);
 template <typename E> void scan_relocations(Context<E> &);
-template <typename E> void compute_imported_symbol_weakness(Context<E> &);
 template <typename E> void sort_dynsyms(Context<E> &);
 template <typename E> void sort_debug_info_sections(Context<E> &);
 template <typename E> void create_output_symtab(Context<E> &);
@@ -2837,6 +2875,11 @@ struct Context {
   // `objs` and `dsos`.
   tbb::concurrent_vector<std::pair<std::vector<u32>, InputFile<E> *>> unsorted_input_files;
 
+  // IR files for LTO found by the file reader. read_input_files()
+  // hands them to the LTO plugin in the command line order once all
+  // input files have been found.
+  tbb::concurrent_vector<ReaderJob> lto_jobs;
+
   // Symbol table. Object file parsing records each global symbol with add(),
   // together with the file's slot for the resulting Symbol pointer.
   // gather_symbols() gathers them. Other symbols, such as linker-synthesized
@@ -3239,7 +3282,8 @@ public:
   bool is_fragment_dummy : 1 = false;
 
   // The name bytes live in the surrounding map entry or the owner file.
-  NameLen namelen;
+  // Cache exact lengths, with a suffix-scanning fallback for INT32_MAX.
+  i32 namelen = 0;
 };
 
 template <typename E>
@@ -3446,23 +3490,42 @@ inline std::span<FdeRecord<E>> InputSection<E>::get_fdes() const {
 }
 
 template <typename E>
-std::pair<SectionFragment<E> *, i64>
+inline std::pair<SectionFragment<E> *, i64>
 InputSection<E>::get_fragment(Context<E> &ctx, const ElfRel<E> &rel) {
   assert(!(shdr().sh_flags & SHF_ALLOC));
 
-  const ElfSym<E> &esym = file->elf_syms[rel.r_sym];
-  if (esym.is_abs() || esym.is_common() || esym.is_undef())
-    return {nullptr, 0};
+  struct Cache {
+    InputSection<E> *isec = nullptr;
+    i64 sym_idx = -1;
+    const ElfSym<E> *sym = nullptr;
+    MergeableSection<E> *section = nullptr;
+    i64 next = 0;
+  };
+  static thread_local Cache cache;
 
-  i64 shndx = file->get_shndx(esym);
-  MergeableSection<E> *m = file->sections.get_mergeable(shndx);
+  // Consecutive debug relocations often refer to the same section symbol.
+  if (cache.isec != this || cache.sym_idx != rel.r_sym) {
+    cache.isec = this;
+    cache.sym_idx = rel.r_sym;
+    cache.sym = &file->elf_syms[rel.r_sym];
+    cache.section = nullptr;
+    cache.next = 0;
+    const ElfSym<E> &esym = *cache.sym;
+    if (!esym.is_abs() && !esym.is_common() && !esym.is_undef())
+      cache.section = file->sections.get_mergeable(file->get_shndx(esym));
+  }
+
+  MergeableSection<E> *m = cache.section;
   if (!m)
     return {nullptr, 0};
 
+  const ElfSym<E> &esym = *cache.sym;
   if (esym.st_type == STT_SECTION)
-    return m->get_fragment(esym.st_value + get_addend(*this, rel));
+    return m->get_fragment(esym.st_value + get_addend(*this, rel),
+                           &cache.next);
 
-  std::pair<SectionFragment<E> *, i64> p = m->get_fragment(esym.st_value);
+  std::pair<SectionFragment<E> *, i64> p =
+    m->get_fragment(esym.st_value, &cache.next);
   return {p.first, p.second + get_addend(*this, rel)};
 }
 
@@ -3518,10 +3581,19 @@ InputSection<E>::check_range(Context<E> &ctx, i64 i, i64 val, i64 lo, i64 hi) {
 }
 
 template <typename E>
-std::pair<SectionFragment<E> *, i64>
-MergeableSection<E>::get_fragment(i64 offset) {
-  auto it = ranges::upper_bound(frag_offsets, offset);
-  i64 idx = it - 1 - frag_offsets.begin();
+inline std::pair<SectionFragment<E> *, i64>
+MergeableSection<E>::get_fragment(i64 offset, i64 *hint) {
+  // Relocations such as .debug_str_offsets usually visit consecutive strings.
+  // Try the next fragment before falling back to a binary search.
+  i64 idx = hint ? *hint : frag_offsets.size();
+  if (idx >= frag_offsets.size() || offset < frag_offsets[idx] ||
+      (idx + 1 < frag_offsets.size() && frag_offsets[idx + 1] <= offset))
+    idx = ranges::upper_bound(frag_offsets, offset) - 1 - frag_offsets.begin();
+  if (hint) {
+    *hint = idx + 1;
+    if (idx + 8 < fragments.size())
+      parent.map.prefetch(fragments[idx + 8]);
+  }
   return {&parent.map.entries[fragments[idx]].value, offset - frag_offsets[idx]};
 }
 
@@ -3675,7 +3747,7 @@ inline bool ObjectFile<E>::is_discarded_comdat(const ElfSym<E> &esym) {
 template <typename E>
 u64 Symbol<E>::get_addr(Context<E> &ctx, i64 flags) const {
   if (SectionFragment<E> *frag = get_frag()) {
-    if (!frag->is_alive) {
+    if (!frag->is_alive) [[unlikely]] {
       // This condition is met if a non-alloc section refers an
       // alloc section and if the referenced piece of data is
       // garbage-collected. Typically, this condition occurs if a
@@ -3686,7 +3758,7 @@ u64 Symbol<E>::get_addr(Context<E> &ctx, i64 flags) const {
     return frag->get_addr(ctx) + value;
   }
 
-  if (has_copyrel) {
+  if (has_copyrel) [[unlikely]] {
     return is_copyrel_readonly
       ? ctx.copyrel_relro->shdr.sh_addr + value
       : ctx.copyrel->shdr.sh_addr + value;
@@ -3705,7 +3777,7 @@ u64 Symbol<E>::get_addr(Context<E> &ctx, i64 flags) const {
   if (!isec)
     return value; // absolute symbol
 
-  if (!isec->is_alive()) {
+  if (!isec->is_alive()) [[unlikely]] {
     if (isec->is_icf_removed())
       return isec->icf_leader->get_addr() + value;
 
@@ -3924,13 +3996,16 @@ inline bool Symbol<E>::is_absolute() const {
 // output symbol table. Note that a symbol that is merely not exported to
 // the dynamic symbol table is still a global symbol; besides symbols that
 // are local in the input file, only ones hidden by symbol visibility or
-// localized by a version script are demoted.
+// localized by a version script are demoted. Linker-synthesized symbols
+// are the exception; they are local unless we export them.
 template <typename E>
 inline bool Symbol<E>::is_local(Context<E> &ctx) const {
   if (esym().st_bind == STB_LOCAL)
     return true;
   if (ctx.arg.relocatable)
     return false;
+  if (file == ctx.internal_obj)
+    return !is_exported;
   return visibility == STV_HIDDEN || visibility == STV_INTERNAL ||
          ver_idx == VER_NDX_LOCAL;
 }
@@ -4049,16 +4124,16 @@ inline const ElfSym<E> &Symbol<E>::esym() const {
 
 template <typename E>
 inline void Symbol<E>::set_name(std::string_view name) {
-  namelen = name.size();
+  namelen = std::min<i64>(name.size(), INT32_MAX);
 }
 
 template <typename E>
 inline std::string_view Symbol<E>::name() const {
   if (has_map_name) {
     std::string_view key = get_sharded_map_key(*this);
-    if (namelen.is_long())
-      return key.substr(0, key.find('@', namelen.lower_bound()));
-    return key.substr(0, namelen.lower_bound());
+    if (namelen == INT32_MAX)
+      return key.substr(0, key.find('@', namelen));
+    return key.substr(0, namelen);
   }
 
   if (is_fragment_dummy)
@@ -4077,7 +4152,10 @@ inline std::string_view Symbol<E>::name() const {
     nameptr = file->symbol_strtab.data() + esym.st_name;
   }
 
-  return namelen.get_string(nameptr);
+  i64 len = namelen;
+  if (namelen == INT32_MAX)
+    len += strlen(nameptr + len);
+  return std::string_view(nameptr, len);
 }
 
 inline bool is_c_identifier(std::string_view s) {

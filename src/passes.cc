@@ -193,13 +193,6 @@ void create_synthetic_sections(Context<E> &ctx) {
   ctx.verneed = push(new VerneedSection<E>);
   ctx.note_package = push(new NotePackageSection<E>);
 
-  if (!ctx.arg.oformat_binary) {
-    ElfShdr<E> shdr = {};
-    shdr.sh_type = SHT_PROGBITS;
-    shdr.sh_flags = SHF_MERGE | SHF_STRINGS;
-    ctx.comment = MergedSection<E>::get_instance(ctx, ".comment", shdr);
-  }
-
   if constexpr (is_x86<E>)
     ctx.extra.note_property = push(new NotePropertySection<E>);
 
@@ -235,14 +228,11 @@ static void mark_live_objects(Context<E> &ctx) {
 
   if (!ctx.arg.undefined_glob.empty()) {
     tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-      if (!file->is_reachable) {
-        for (Symbol<E> *sym : file->get_global_syms()) {
-          if (sym->file == file &&
-              ctx.arg.undefined_glob.find(sym->name()) != -1) {
-            file->is_reachable = true;
-            sym->gc_root = true;
-            break;
-          }
+      for (Symbol<E> *sym : file->get_global_syms()) {
+        if (sym->file == file &&
+            ctx.arg.undefined_glob.find(sym->name()) != -1) {
+          file->is_reachable = true;
+          sym->gc_root = true;
         }
       }
     });
@@ -251,11 +241,6 @@ static void mark_live_objects(Context<E> &ctx) {
   std::vector<InputFile<E> *> roots;
   append(roots, ctx.objs);
   append(roots, ctx.dsos);
-
-  for (InputFile<E> *file : roots)
-    if (!file->as_needed)
-      file->is_reachable = true;
-
   std::erase_if(roots, [](InputFile<E> *file) { return !file->is_reachable; });
   mark_live_objects(ctx, roots);
 }
@@ -404,23 +389,29 @@ static void parse_input_sections(Context<E> &ctx) {
     });
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    if (file->is_reachable && file->mf && !file->is_lto_input &&
-        !file->sections_parsed)
-      file->parse_sections(ctx, keep_discarded_comdat);
-  });
+    if (!file->is_reachable)
+      return;
 
-  // Apply the selection to all group members. This also updates sections
-  // parsed before LTO if ownership has changed.
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    if (file->is_reachable)
-      for (ComdatGroupRef<E> &ref : file->comdat_groups)
-        for (u32 i : ref.members(*file))
-          if (InputSection<E> *isec = file->sections[i]) {
-            if (ref.is_owner)
-              isec->flags |= InputSection<E>::IS_ALIVE;
-            else
-              isec->kill();
-          }
+    if (file->mf && !file->is_lto_input && !file->sections_parsed) {
+      file->parse_sections(ctx, keep_discarded_comdat);
+      // Parsing already omitted losing groups and constructed the rest alive.
+      // --gdb-index can separately kill group members while parsing.
+      if (!keep_discarded_comdat && !ctx.arg.gdb_index)
+        return;
+    }
+
+    // Apply the selection to all group members. This also updates sections
+    // parsed before LTO if ownership has changed.
+    for (ComdatGroupRef<E> &ref : file->comdat_groups) {
+      for (u32 i : ref.members(*file)) {
+        if (InputSection<E> *isec = file->sections[i]) {
+          if (ref.is_owner)
+            isec->flags |= InputSection<E>::IS_ALIVE;
+          else
+            isec->kill();
+        }
+      }
+    }
   });
 }
 
@@ -566,9 +557,18 @@ template <typename E>
 void create_merged_sections(Context<E> &ctx) {
   Timer t(ctx, "create_merged_sections");
 
+  // Create the linker identification section before resolving merged sections.
+  if (!ctx.arg.oformat_binary && !ctx.arg.relocatable) {
+    ElfShdr<E> shdr = {};
+    shdr.sh_type = SHT_PROGBITS;
+    shdr.sh_flags = SHF_MERGE | SHF_STRINGS;
+    ctx.comment = MergedSection<E>::get_instance(ctx, ".comment", shdr);
+  }
+
   // Convert InputSections to MergeableSections.
+  tbb::enumerable_thread_specific<std::vector<MergedSection<E> *>> caches;
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->convert_mergeable_sections(ctx);
+    file->convert_mergeable_sections(ctx, caches.local());
   });
 
   // Register each mergeable section with its merged section. There are
@@ -1282,12 +1282,12 @@ void check_symbol_version_conflicts(Context<E> &ctx) {
 
   Timer t(ctx, "check_symbol_version_conflicts");
 
-  for (i64 i = 1; i < ctx.dynsym->symbols.size(); i++) {
+  tbb::parallel_for((i64)1, (i64)ctx.dynsym->symbols.size(), [&](i64 i) {
     Symbol<E> *sym = ctx.dynsym->symbols[i];
     if (sym->file->is_dso || sym->is_weak ||
         sym->ver_idx == VER_NDX_UNSPECIFIED ||
         !(sym->ver_idx & VERSYM_HIDDEN))
-      continue;
+      return;
 
     Symbol<E> *sym2 = get_symbol(ctx, sym->name());
     if (sym2 != sym && sym2->file && !sym2->file->is_dso && !sym2->is_weak &&
@@ -1296,7 +1296,7 @@ void check_symbol_version_conflicts(Context<E> &ctx) {
       Error(ctx) << "duplicate symbol: " << *file << ": " << *sym2->file
                  << ": " << file->get_symbol_name(sym->sym_idx);
     }
-  }
+  });
 
   ctx.checkpoint();
 }
@@ -1692,7 +1692,7 @@ void sort_debug_info_sections(Context<E> &ctx) {
   });
 
   tbb::parallel_for_each(vec2, [&](MergedSection<E> *osec) {
-    osec->compute_section_size(ctx);
+    osec->assign_offsets(ctx);
   });
 }
 
@@ -1978,7 +1978,7 @@ void scan_relocations(Context<E> &ctx) {
   // Exit if the absolute-relocation pass reported an error.
   ctx.checkpoint();
 
-  // Aggregate dynamic symbols to a single vector.
+  // Allocate auxiliary data and collect dynamic symbols in parallel.
   std::vector<InputFile<E> *> files;
   append(files, ctx.objs);
   append(files, ctx.dsos);
@@ -1986,10 +1986,15 @@ void scan_relocations(Context<E> &ctx) {
   std::vector<std::vector<Symbol<E> *>> vec(files.size());
 
   tbb::parallel_for((i64)0, (i64)files.size(), [&](i64 i) {
-    for (Symbol<E> *sym : files[i]->symbols)
-      if (sym->file == files[i])
-        if (sym->flags || sym->is_imported || sym->is_exported)
+    for (Symbol<E> *sym : files[i]->symbols) {
+      if (sym->file == files[i]) {
+        if (sym->flags || sym->is_imported || sym->is_exported) {
+          if (!sym->aux)
+            sym->aux = ctx.arena.template make<SymbolAux<E>>();
           vec[i].push_back(sym);
+        }
+      }
+    }
   });
 
   std::vector<Symbol<E> *> syms = flatten(vec);
@@ -1998,10 +2003,15 @@ void scan_relocations(Context<E> &ctx) {
     ctx.got->add_tlsld(ctx);
 
   // Assign offsets in additional tables for each dynamic symbol.
-  for (Symbol<E> *sym : syms) {
-    if (!sym->aux)
-      sym->aux = ctx.arena.template make<SymbolAux<E>>();
-
+  for (i64 i = 0; i < syms.size(); i++) {
+#ifdef __GNUC__
+    // Fetch symbols before their auxiliary records to hide both pointer loads.
+    if (i + 64 < syms.size())
+      __builtin_prefetch(syms[i + 64]);
+    if (i + 16 < syms.size())
+      __builtin_prefetch((SymbolAux<E> *)syms[i + 16]->aux);
+#endif
+    Symbol<E> *sym = syms[i];
     if (sym->is_imported || sym->is_exported)
       ctx.dynsym->add_symbol(ctx, sym);
 
@@ -2051,27 +2061,6 @@ void scan_relocations(Context<E> &ctx) {
 
   if (ctx.has_textrel && ctx.arg.warn_textrel)
     Warn(ctx) << "creating a DT_TEXTREL in an output file";
-}
-
-// Compute the is_weak bit for each imported symbol.
-//
-// If all references to a shared symbol is weak, the symbol is marked
-// as weak in .dynsym.
-template <typename E>
-void compute_imported_symbol_weakness(Context<E> &ctx) {
-  Timer t(ctx, "compute_imported_symbol_weakness");
-
-  tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-    for (i64 i = file->first_global; i < file->elf_syms.size(); i++) {
-      const ElfSym<E> &esym = file->elf_syms[i];
-      Symbol<E> &sym = *file->symbols[i];
-
-      if (esym.is_undef() && !esym.is_weak() && sym.file && sym.file->is_dso) {
-        std::scoped_lock lock(sym.mu);
-        sym.is_weak = false;
-      }
-    }
-  });
 }
 
 // Report all undefined symbols, grouped by symbol.
@@ -2188,9 +2177,18 @@ void copy_chunks(Context<E> &ctx) {
 
 // The hash function for .gnu.hash.
 static u32 djb_hash(std::string_view name) {
+  // Evaluate four bytes at a time to shorten the dependency chain.
+  // Factor the polynomial into pairs to reduce the number of multiplies.
+  const u8 *p = (const u8 *)name.data();
   u32 h = 5381;
-  for (u8 c : name)
-    h = (h << 5) + h + c;
+  i64 i = 0;
+  for (; i + 4 <= name.size(); i += 4) {
+    u32 a = p[i] * 33 + p[i + 1];
+    u32 b = p[i + 2] * 33 + p[i + 3];
+    h = h * 1185921 + a * 1089 + b;
+  }
+  for (; i < name.size(); i++)
+    h = (h << 5) + h + p[i];
   return h;
 }
 
@@ -2203,14 +2201,18 @@ void sort_dynsyms(Context<E> &ctx) {
     return;
 
   // In any symtab, local symbols must precede global symbols.
-  auto globals = ranges::stable_partition(syms.subspan(1), [&](Symbol<E> *sym) {
+  auto globals = parallel_stable_partition(syms.subspan(1), [&](Symbol<E> *sym) {
     return sym->is_local(ctx);
   });
+
+  auto &dynstr_entries = ctx.dynsym->dynstr_entries;
+  dynstr_entries.resize(syms.size());
+  i64 first_exported = syms.size();
 
   // .gnu.hash imposes more restrictions on the order of the symbols in
   // .dynsym.
   if (ctx.gnu_hash) {
-    auto exported_syms = ranges::stable_partition(globals, [](Symbol<E> *sym) {
+    auto exported_syms = parallel_stable_partition(globals, [](Symbol<E> *sym) {
       return !sym->is_exported;
     });
 
@@ -2218,13 +2220,31 @@ void sort_dynsyms(Context<E> &ctx) {
     i64 num_exported = exported_syms.size();
     u32 num_buckets = num_exported / ctx.gnu_hash->LOAD_FACTOR + 1;
 
-    tbb::parallel_for_each(exported_syms, [&](Symbol<E> *sym) {
-      sym->aux->djb_hash = djb_hash(sym->name());
+    // Keep the sort keys together so comparisons don't have to chase
+    // symbol pointers or recompute name lengths and bucket indices.
+    struct Entry {
+      u32 bucket;
+      std::string_view name;
+      Symbol<E> *sym;
+    };
+    std::vector<Entry> entries(num_exported);
+
+    tbb::parallel_for((i64)0, num_exported, [&](i64 i) {
+      Symbol<E> *sym = exported_syms[i];
+      std::string_view name = sym->name();
+      u32 hash = djb_hash(name);
+      sym->aux->djb_hash = hash;
+      entries[i] = {hash % num_buckets, name, sym};
     });
 
-    tbb::parallel_sort(exported_syms, [&](Symbol<E> *a, Symbol<E> *b) {
-      return std::tuple(a->aux->djb_hash % num_buckets, a->name()) <
-             std::tuple(b->aux->djb_hash % num_buckets, b->name());
+    tbb::parallel_sort(entries, [](const Entry &a, const Entry &b) {
+      return std::tie(a.bucket, a.name) < std::tie(b.bucket, b.name);
+    });
+
+    first_exported = exported_syms.data() - syms.data();
+    tbb::parallel_for((i64)0, num_exported, [&](i64 i) {
+      exported_syms[i] = entries[i].sym;
+      dynstr_entries[first_exported + i].name = entries[i].name;
     });
 
     ctx.gnu_hash->num_buckets = num_buckets;
@@ -2234,13 +2254,25 @@ void sort_dynsyms(Context<E> &ctx) {
   // Compute .dynstr size
   ctx.dynsym->dynstr_offset = ctx.dynstr->shdr.sh_size;
 
-  tbb::enumerable_thread_specific<i64> size;
+  // Keep names and string offsets for both dynamic-table output passes.
+  // Exported names are already available from the GNU hash sort keys.
   tbb::parallel_for((i64)1, (i64)syms.size(), [&](i64 i) {
     syms[i]->aux->dynsym_idx = i;
-    size.local() += syms[i]->name().size() + 1;
+    if (i < first_exported)
+      dynstr_entries[i].name = syms[i]->name();
   });
 
-  ctx.dynstr->shdr.sh_size += size.combine(std::plus());
+  auto scan = [&](const tbb::blocked_range<i64> &r, i64 sum, bool is_final) {
+    for (i64 i = r.begin(); i < r.end(); i++) {
+      if (is_final)
+        dynstr_entries[i].offset = ctx.dynsym->dynstr_offset + sum;
+      sum += dynstr_entries[i].name.size() + 1;
+    }
+    return sum;
+  };
+
+  ctx.dynstr->shdr.sh_size += tbb::parallel_scan(
+    tbb::blocked_range<i64>(1, syms.size(), 1024), (i64)0, scan, std::plus());
 
   // ELF's symbol table sh_info holds the offset of the first global symbol.
   ctx.dynsym->shdr.sh_info = globals.begin() - syms.begin();
@@ -2297,13 +2329,18 @@ void apply_version_script(Context<E> &ctx) {
     return str.find_first_of("*?[") != str.npos;
   };
 
+  // Consecutive patterns assigning the same version have the same outcome.
+  // Give them one priority so the matcher can stop at a definitive result.
+  i64 priority = 0;
   for (i64 i = 0; i < patterns.size(); i++) {
     VersionPattern &v = patterns[i];
+    if (i > 0 && v.ver_idx != patterns[i - 1].ver_idx)
+      priority = i;
     if (v.is_cpp) {
-      if (!cpp_matcher.add(v.pattern, i))
+      if (!cpp_matcher.add(v.pattern, priority))
         Fatal(ctx) << "invalid version pattern: " << v.pattern;
     } else if (has_wildcard(v.pattern)) {
-      if (!matcher.add(v.pattern, i))
+      if (!matcher.add(v.pattern, priority))
         Fatal(ctx) << "invalid version pattern: " << v.pattern;
     }
   }
@@ -2473,11 +2510,21 @@ void compute_import_export(Context<E> &ctx) {
   // Export symbols that are not hidden or marked as local.
   // We also want to mark imported symbols as such.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    for (Symbol<E> *sym : file->get_global_syms()) {
+    for (i64 i = file->first_global; i < file->symbols.size(); i++) {
+      Symbol<E> *sym = file->symbols[i];
+
       // If we are using a symbol in a DSO, we need to import it.
       if (sym->file && sym->file->is_dso) {
         std::scoped_lock lock(sym->mu);
         sym->is_imported = true;
+
+        // Shared symbols start weak and remain so only if every
+        // undefined reference is weak. Compute binding under the same
+        // lock instead of scanning all object symbols again later.
+        if (i < file->elf_syms.size())
+          if (const ElfSym<E> &esym = file->elf_syms[i];
+              esym.is_undef() && !esym.is_weak())
+            sym->is_weak = false;
         continue;
       }
 
@@ -3985,7 +4032,6 @@ template void add_dynamic_strings(Context<E> &);
 template void compute_section_sizes(Context<E> &);
 template void sort_output_sections(Context<E> &);
 template void claim_unresolved_symbols(Context<E> &);
-template void compute_imported_symbol_weakness(Context<E> &);
 template void scan_relocations(Context<E> &);
 template void report_undef_errors(Context<E> &);
 template void create_reloc_sections(Context<E> &);

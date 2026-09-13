@@ -3,6 +3,7 @@
 #include "atomics.h"
 #include "integers.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -27,6 +29,8 @@
 #include <tbb/concurrent_vector.h>
 #include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
+#include <tbb/parallel_reduce.h>
+#include <tbb/parallel_scan.h>
 #include <vector>
 
 #ifdef _WIN32
@@ -331,6 +335,50 @@ template <typename T>
 inline void write_vector(void *buf, const std::vector<T> &vec) {
   if (!vec.empty())
     memcpy(buf, vec.data(), vec.size() * sizeof(T));
+}
+
+// Return the suffix that doesn't satisfy pred, preserving both groups' order.
+// A prefix sum gives each element a destination without a serial merge.
+template <typename T, typename Pred>
+std::span<T> parallel_stable_partition(std::span<T> span, Pred pred) {
+  if (span.size() <= 16384) {
+    auto tail = ranges::stable_partition(span, pred);
+    return {tail.begin(), tail.end()};
+  }
+
+  tbb::blocked_range<i64> range(0, span.size(), 16384);
+  ExactArray<u8> matches(span.size());
+  i64 num_matches = tbb::parallel_reduce(range, (i64)0,
+    [&](const auto &r, i64 count) {
+      for (i64 i = r.begin(); i < r.end(); i++) {
+        matches[i] = bool(pred(span[i]));
+        count += matches[i];
+      }
+      return count;
+    }, std::plus());
+
+  if (num_matches == 0 || num_matches == span.size())
+    return span.subspan(num_matches);
+
+  ExactArray<T> buf(span.size());
+  tbb::parallel_scan(range, (i64)0,
+    [&](const auto &r, i64 count, bool is_final) {
+      for (i64 i = r.begin(); i < r.end(); i++) {
+        if (is_final) {
+          // count matches and i - count non-matches precede this element.
+          i64 dst = matches[i] ? count : num_matches + i - count;
+          buf[dst] = std::move(span[i]);
+        }
+        count += matches[i];
+      }
+      return count;
+    }, std::plus());
+
+  tbb::parallel_for(range, [&](const auto &r) {
+    std::move(buf.data() + r.begin(), buf.data() + r.end(),
+              span.begin() + r.begin());
+  });
+  return span.subspan(num_matches);
 }
 
 inline void parallel_memcpy(void *dst, const void *src, i64 size) {
@@ -696,8 +744,14 @@ public:
 
 private:
   void *allocate_global(u64 size, u64 alignment);
+  void commit(u64 end);
 
   u8 *data;
+
+  // The reserved range is made accessible in chunks as allocations advance.
+  // Bytes below `committed` are accessible.
+  std::atomic<u64> committed = 0;
+  std::mutex commit_mu;
 
   // Index into the per-thread array of allocation blocks. Slots are never
   // reused, so a new arena cannot inherit stale pointers from an old one.
@@ -925,16 +979,12 @@ private:
     i64 capacity;
   };
 
-  // add() already computed the string hash. Store it in the map key so that
-  // unordered_map does not scan the string again.
-  struct PassThroughHash {
-    size_t operator()(const std::pair<u64, std::string_view> &key) const {
-      return key.first;
-    }
+  // Shards are built by one thread at a time. Keep only a cached hash and
+  // an entry pointer in each bucket; keys and values remain in the arena.
+  struct Slot {
+    u64 hash = 0;
+    Entry *entry = nullptr;
   };
-
-  using Map = std::unordered_map<std::pair<u64, std::string_view>, Entry *,
-                                 PassThroughHash>;
 
   struct Shard {
     Shard() = default;
@@ -942,24 +992,50 @@ private:
     Shard &operator=(const Shard &) = delete;
 
     T *insert(std::string_view key, u64 hash, auto on_create) {
-      auto [it, inserted] = map.try_emplace({hash, key}, nullptr);
-      if (!inserted)
-        return it->second;
+      if (size * 4 >= slots.size() * 3)
+        rehash(std::max<i64>(16, slots.size() * 2));
+
+      u64 mask = slots.size() - 1;
+      // The low hash bits already selected the shard.
+      u64 idx = (hash / NUM_SHARDS) & mask;
+      while (slots[idx].entry) {
+        Slot &slot = slots[idx];
+        if (slot.hash == hash && slot.entry->key == key)
+          return slot.entry;
+        idx = (idx + 1) & mask;
+      }
 
       if (blocks.empty() || blocks.back().size == blocks.back().capacity)
         add_block(INSERT_BLOCK_SIZE);
 
       Entry *entry = emplace(blocks.back(), key);
-      it->second = entry;
+      slots[idx] = {hash, entry};
+      size++;
       on_create(key, *entry);
       return entry;
     }
 
     void reserve(i64 count) {
-      map.reserve(map.size() + count);
+      i64 capacity = std::max<i64>(16, bit_ceil((size + count) * 4 / 3 + 1));
+      if (slots.size() < capacity)
+        rehash(capacity);
       if (blocks.empty() ||
           blocks.back().capacity - blocks.back().size < count)
         add_block(std::max<i64>(INSERT_BLOCK_SIZE, count));
+    }
+
+    void rehash(i64 capacity) {
+      std::vector<Slot> vec(capacity);
+      u64 mask = capacity - 1;
+      for (Slot slot : slots) {
+        if (!slot.entry)
+          continue;
+        u64 idx = (slot.hash / NUM_SHARDS) & mask;
+        while (vec[idx].entry)
+          idx = (idx + 1) & mask;
+        vec[idx] = slot;
+      }
+      slots = std::move(vec);
     }
 
     static constexpr i64 INSERT_BLOCK_SIZE = 256;
@@ -978,7 +1054,8 @@ private:
     std::mutex mu;
     ArenaResource *arena = nullptr;
     std::vector<Block> blocks;
-    Map map;
+    std::vector<Slot> slots;
+    i64 size = 0;
   };
 
   Shard shards[NUM_SHARDS];
@@ -1052,6 +1129,7 @@ private:
   // it is visited for almost every input byte; other edges are stored sparsely.
   std::array<i32, 256> root_children;
   std::vector<TrieNode> nodes;
+  i64 max_value = -1;
 };
 
 class Glob {
@@ -1064,6 +1142,7 @@ private:
   std::once_flag once;
   bool is_empty = true;
   bool is_compiled = false;
+  i64 max_value = -1;
 
   // Patterns that need only a literal string comparison are kept out
   // of the automaton-based matchers below, which scan the entire input

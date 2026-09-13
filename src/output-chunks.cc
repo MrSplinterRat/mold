@@ -5,6 +5,7 @@
 #include <shared_mutex>
 #include <span>
 #include <tbb/parallel_for_each.h>
+#include <tbb/parallel_invoke.h>
 #include <tbb/parallel_scan.h>
 #include <tbb/parallel_sort.h>
 
@@ -604,10 +605,10 @@ void DynstrSection<E>::copy_buf(Context<E> &ctx) {
   for (std::pair<std::string_view, i64> p : strings)
     write_string(base + p.second, p.first);
 
-  i64 off = ctx.dynsym->dynstr_offset;
-  for (Symbol<E> *sym : ctx.dynsym->symbols)
-    if (sym)
-      off += write_string(base + off, sym->name());
+  auto &entries = ctx.dynsym->dynstr_entries;
+  tbb::parallel_for((i64)1, (i64)entries.size(), [&](i64 i) {
+    write_string(base + entries[i].offset, entries[i].name);
+  });
 }
 
 template <typename E>
@@ -675,19 +676,23 @@ void SymtabSection<E>::copy_buf(Context<E> &ctx) {
     }
   }
 
-  // Populate linker-synthesized symbols
-  tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-    chunk->populate_symtab(ctx);
-  });
-
-  // Copy symbols from input files
-  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
-    file->populate_symtab(ctx);
-  });
-
-  tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
-    file->populate_symtab(ctx);
-  });
+  // These groups write disjoint symbol and string-table ranges.
+  tbb::parallel_invoke(
+    [&] {
+      tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
+        chunk->populate_symtab(ctx);
+      });
+    },
+    [&] {
+      tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+        file->populate_symtab(ctx);
+      });
+    },
+    [&] {
+      tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
+        file->populate_symtab(ctx);
+      });
+    });
 }
 
 // An ARM64 function with a non-standard calling convention is marked with
@@ -1901,14 +1906,6 @@ void GotPltSection<E>::copy_buf(Context<E> &ctx) {
 }
 
 template <typename E>
-void PltSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  assert(!sym->has_plt(ctx));
-  sym->aux->plt_idx = symbols.size();
-  symbols.push_back(sym);
-  ctx.dynsym->add_symbol(ctx, sym);
-}
-
-template <typename E>
 void PltSection<E>::update_shdr(Context<E> &ctx) {
   if (symbols.empty())
     this->shdr.sh_size = 0;
@@ -1930,10 +1927,12 @@ void PltSection<E>::copy_buf(Context<E> &ctx) {
 template <typename E>
 void PltSection<E>::compute_symtab_size(Context<E> &ctx) {
   this->num_local_symtab = symbols.size();
-  this->strtab_size = 0;
 
-  for (Symbol<E> *sym : symbols)
-    this->strtab_size += sym->name().size() + sizeof("$plt");
+  tbb::enumerable_thread_specific<i64> size;
+  tbb::parallel_for((i64)0, (i64)symbols.size(), [&](i64 i) {
+    size.local() += symbols[i]->name().size() + sizeof("$plt");
+  });
+  this->strtab_size = size.combine(std::plus());
 
   if constexpr (is_arm32<E>)
     this->num_local_symtab += symbols.size() * 2 + 2;
@@ -1976,16 +1975,6 @@ void PltSection<E>::populate_symtab(Context<E> &ctx) {
       write_esym(addr + 12, ctx.strtab->DATA);
     }
   }
-}
-
-template <typename E>
-void PltGotSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  assert(!sym->has_plt(ctx));
-  assert(sym->has_got(ctx));
-
-  sym->aux->pltgot_idx = symbols.size();
-  symbols.push_back(sym);
-  this->shdr.sh_size = symbols.size() * E::pltgot_size;
 }
 
 template <typename E>
@@ -2227,17 +2216,6 @@ to_output_esym(Context<E> &ctx, Symbol<E> &sym, u32 st_name, U32<E> *shn_xindex)
 }
 
 template <typename E>
-void DynsymSection<E>::add_symbol(Context<E> &ctx, Symbol<E> *sym) {
-  if (symbols.empty())
-    symbols.resize(1);
-
-  if (sym->get_dynsym_idx(ctx) == -1) {
-    sym->aux->dynsym_idx = -2;
-    symbols.push_back(sym);
-  }
-}
-
-template <typename E>
 void DynsymSection<E>::update_shdr(Context<E> &ctx) {
   this->shdr.sh_link = ctx.dynstr->shndx;
   this->shdr.sh_size = sizeof(ElfSym<E>) * symbols.size();
@@ -2246,25 +2224,25 @@ void DynsymSection<E>::update_shdr(Context<E> &ctx) {
 template <typename E>
 void DynsymSection<E>::copy_buf(Context<E> &ctx) {
   ElfSym<E> *buf = (ElfSym<E> *)(ctx.buf + this->shdr.sh_offset);
-  i64 offset = dynstr_offset;
-
   memset(buf, 0, sizeof(ElfSym<E>));
+  if (symbols.size() <= 1)
+    return;
 
-  for (i64 i = 1; i < symbols.size(); i++) {
+  std::atomic<bool> overflow = false;
+  tbb::parallel_for((i64)1, (i64)symbols.size(), [&](i64 i) {
     Symbol<E> &sym = *symbols[i];
+    if (std::optional<ElfSym<E>> esym =
+          to_output_esym(ctx, sym, dynstr_entries[i].offset, nullptr))
+      buf[sym.get_dynsym_idx(ctx)] = *esym;
+    else
+      overflow.store(true, std::memory_order_relaxed);
+  });
 
-    std::optional<ElfSym<E>> esym = to_output_esym(ctx, sym, offset, nullptr);
-    if (!esym) {
-      Error(ctx) << ctx.arg.output
-                 << ": .dynsym: too many output sections: "
-                 << (ctx.shdr->shdr.sh_size / sizeof(ElfShdr<E>))
-                 << " requested, but ELF allows at most 65279";
-      return;
-    }
-
-    buf[sym.get_dynsym_idx(ctx)] = *esym;
-    offset += sym.name().size() + 1;
-  }
+  if (overflow)
+    Error(ctx) << ctx.arg.output
+               << ": .dynsym: too many output sections: "
+               << (ctx.shdr->shdr.sh_size / sizeof(ElfShdr<E>))
+               << " requested, but ELF allows at most 65279";
 }
 
 template <typename E>
@@ -2410,7 +2388,8 @@ MergedSection<E>::MergedSection(std::string_view name, i64 flags, i64 type,
 template <typename E>
 MergedSection<E> *
 MergedSection<E>::get_instance(Context<E> &ctx, std::string_view name,
-                               const ElfShdr<E> &shdr) {
+                               const ElfShdr<E> &shdr,
+                               std::vector<MergedSection<E> *> *cache) {
   if (!(shdr.sh_flags & SHF_MERGE))
     return nullptr;
 
@@ -2425,11 +2404,29 @@ MergedSection<E>::get_instance(Context<E> &ctx, std::string_view name,
 
   name = get_merged_output_name(ctx, name, flags, entsize, addralign);
 
+  auto matches = [&](MergedSection *osec) {
+    return name == osec->name && flags == osec->shdr.sh_flags &&
+           shdr.sh_type == osec->shdr.sh_type &&
+           entsize == osec->shdr.sh_entsize;
+  };
+
+  // These fields are immutable while inputs are being converted. Reuse
+  // output sections found by this worker without touching the shared lock.
+  if (cache)
+    for (MergedSection *osec : *cache)
+      if (matches(osec))
+        return osec;
+
+  auto remember = [&](MergedSection *osec) {
+    // Keep lookup bounded even if --unique creates many output sections.
+    if (cache && cache->size() < 32)
+      cache->push_back(osec);
+    return osec;
+  };
+
   auto find = [&]() -> MergedSection * {
     for (ArenaObjectPtr<MergedSection<E>> &osec : ctx.merged_sections)
-      if (name == osec->name && flags == osec->shdr.sh_flags &&
-          shdr.sh_type == osec->shdr.sh_type &&
-          entsize == osec->shdr.sh_entsize)
+      if (matches(osec.get()))
         return osec.get();
     return nullptr;
   };
@@ -2439,19 +2436,19 @@ MergedSection<E>::get_instance(Context<E> &ctx, std::string_view name,
   {
     std::shared_lock lock(mu);
     if (MergedSection *osec = find())
-      return osec;
+      return remember(osec);
   }
 
   // Create a new output section.
   std::unique_lock lock(mu);
   if (MergedSection *osec = find())
-    return osec;
+    return remember(osec);
 
   void *buf = ctx.arena.template allocate<MergedSection>(1);
   MergedSection *osec =
     new (buf) MergedSection(name, flags, shdr.sh_type, entsize);
   ctx.merged_sections.emplace_back(osec);
-  return osec;
+  return remember(osec);
 }
 
 template <typename E>
@@ -2519,6 +2516,11 @@ void MergedSection<E>::resolve(Context<E> &ctx) {
   this->shdr.sh_addralign = 1 << p2align;
 
   resolved = true;
+
+  // Non-allocated fragments are never garbage-collected, so their layout
+  // can be completed in the same background task as string merging.
+  if (!(this->shdr.sh_flags & SHF_ALLOC))
+    assign_offsets(ctx);
 }
 
 template <typename E>
@@ -2526,6 +2528,12 @@ void MergedSection<E>::compute_section_size(Context<E> &ctx) {
   if (!resolved)
     resolve(ctx);
 
+  if (this->shdr.sh_flags & SHF_ALLOC)
+    assign_offsets(ctx);
+}
+
+template <typename E>
+void MergedSection<E>::assign_offsets(Context<E> &ctx) {
   std::vector<i64> sizes(map.NUM_SHARDS * 2);
 
   tbb::parallel_for((i64)0, map.NUM_SHARDS, [&](i64 i) {
@@ -3221,16 +3229,16 @@ void VerdefSection<E>::construct(Context<E> &ctx) {
   ctx.versym->contents.resize(ctx.dynsym->symbols.size(), VER_NDX_GLOBAL);
   ctx.versym->contents[0] = VER_NDX_LOCAL;
 
-  for (Symbol<E> *sym : ctx.dynsym->symbols) {
+  tbb::parallel_for_each(ctx.dynsym->symbols, [&](Symbol<E> *sym) {
     if (!sym || sym->file->is_dso)
-      continue;
+      return;
 
     // An unversioned undefined symbol takes version index 0.
     if (sym->ver_idx != VER_NDX_UNSPECIFIED)
       ctx.versym->contents[sym->get_dynsym_idx(ctx)] = sym->ver_idx;
     else if (sym->esym().is_undef())
       ctx.versym->contents[sym->get_dynsym_idx(ctx)] = VER_NDX_LOCAL;
-  }
+  });
 
   // Allocate a buffer for .gnu.version_d and write to it
   contents.resize((sizeof(ElfVerdef<E>) + sizeof(ElfVerdaux<E>)) *

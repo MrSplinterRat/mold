@@ -36,9 +36,24 @@ static void new_object_file(Context<E> &ctx, ReaderContext &rctx,
   ctx.obj_pool.emplace_back(file);
   file->as_needed =
     rctx.in_lib || (!archive_name.empty() && !rctx.whole_archive);
+  file->is_reachable = !file->as_needed;
 
   file->parse_symbols(ctx);
   ctx.unsorted_input_files.push_back({rctx.pos, file});
+}
+
+// IR files for LTO are not read in place. We only record them here,
+// and read_input_files() hands them to the LTO plugin once all input
+// files have been found. We do this because LTO object file reading
+// is order-dependent.
+template <typename E>
+static void defer_lto_obj(Context<E> &ctx, ReaderContext &rctx,
+                          MappedFile *mf, std::string archive_name) {
+  ReaderJob job;
+  job.rctx = rctx;
+  job.mf = mf;
+  job.archive_name = archive_name;
+  ctx.lto_jobs.push_back(std::move(job));
 }
 
 template <typename E>
@@ -57,6 +72,7 @@ static void new_lto_obj(Context<E> &ctx, ReaderContext &rctx,
   file->archive_name = archive_name;
   file->as_needed =
     rctx.in_lib || (!archive_name.empty() && !rctx.whole_archive);
+  file->is_reachable = !file->as_needed;
 
   ctx.unsorted_input_files.push_back({rctx.pos, file});
 }
@@ -72,6 +88,7 @@ static void new_shared_file(Context<E> &ctx, ReaderContext &rctx,
   SharedFile<E> *file = ctx.arena.template make<SharedFile<E>>(ctx, mf);
   ctx.dso_pool.emplace_back(file);
   file->as_needed = rctx.as_needed;
+  file->is_reachable = !file->as_needed;
 
   file->parse(ctx);
   ctx.unsorted_input_files.push_back({rctx.pos, file});
@@ -87,7 +104,7 @@ static void read_archive_member(Context<E> &ctx, ReaderContext &rctx,
     break;
   case FileType::GCC_LTO_OBJ:
   case FileType::LLVM_BITCODE:
-    new_lto_obj(ctx, rctx, mf, archive_name);
+    defer_lto_obj(ctx, rctx, mf, archive_name);
     break;
   case FileType::ELF_DSO:
     Warn(ctx) << archive_name << "(" << mf->name
@@ -100,7 +117,8 @@ static void read_archive_member(Context<E> &ctx, ReaderContext &rctx,
 
 // Reads the given file, which is located at rctx.pos in the command
 // line. If the file is a container, i.e. an archive file or a linker
-// script, the files in it are read in place, recursively.
+// script, the files in it are read in place, recursively. IR files
+// for LTO are only recorded; see defer_lto_obj().
 //
 // read_input_files() reads top-level files with this function too but
 // overrides the container cases to read archive members in parallel.
@@ -125,7 +143,7 @@ void read_file(Context<E> &ctx, ReaderContext &rctx, MappedFile *mf) {
     return;
   case FileType::GCC_LTO_OBJ:
   case FileType::LLVM_BITCODE:
-    new_lto_obj(ctx, rctx, mf, "");
+    defer_lto_obj(ctx, rctx, mf, "");
     return;
   default:
     Fatal(ctx) << mf->name << ": unknown file type";
@@ -213,13 +231,17 @@ static void read_input_files(Context<E> &ctx, std::vector<ReaderJob> &jobs) {
   // Open and read files in parallel. Archive files are expanded into
   // one job per member so that members are read in parallel too.
   //
-  // Linker scripts are the exception to the parallelism: they can
+  // Linker scripts are one exception to the parallelism: they can
   // modify the context, e.g. by defining symbol versions, so we only
   // collect them here and parse them after this loop, one at a time
   // and in the command line order, to keep their effects
   // deterministic. Scripts given as input files are rare and small,
   // such as the GROUP file that glibc installs as libc.so, so the
   // lost parallelism doesn't matter.
+  //
+  // IR files for LTO are the other exception. This loop only records
+  // them, and we hand them to the LTO plugin after the scripts have
+  // been parsed, also in the command line order.
   //
   // Parsing scripts late assumes that no script directive affects how
   // command line arguments after the script are read. That holds for
@@ -294,6 +316,20 @@ static void read_input_files(Context<E> &ctx, std::vector<ReaderJob> &jobs) {
 
   for (ReaderJob &job : scripts)
     Script(ctx, job.rctx, job.mf).parse_linker_script();
+
+  // Hand IR files to the LTO plugin, in the command line order. The
+  // plugin keeps global state, so claims can't run in parallel anyway,
+  // and LLVM's LTO assumes that the module holding the prevailing copy
+  // of a COMDAT group arrives before the modules holding the other
+  // copies, as it does with a serial linker. Otherwise the losing
+  // copies' internal symbols become undefined references in the LTO
+  // result.
+  ranges::sort(ctx.lto_jobs, {}, [](const ReaderJob &job) {
+    return job.rctx.pos;
+  });
+
+  for (ReaderJob &job : ctx.lto_jobs)
+    new_lto_obj(ctx, job.rctx, job.mf, job.archive_name);
 
   // Sort the files into the command line order and assign priorities.
   tbb::parallel_sort(ctx.unsorted_input_files, [](auto &a, auto &b) {
@@ -460,6 +496,21 @@ int mold_main(int argc, char **argv) {
     return 0;
   }
 
+  // Non-allocated merged sections are independent of symbol and relocation
+  // processing. Resolve them while the remaining foreground passes run.
+  tbb::task_arena merge_arena(tbb::task_arena::automatic, 1,
+                              tbb::task_arena::priority::low);
+  tbb::task_group merge_task;
+  merge_arena.execute([&] {
+    merge_task.run([&] {
+      tbb::parallel_for_each(ctx.merged_sections,
+                             [&](ArenaObjectPtr<MergedSection<E>> &sec) {
+        if (!(sec->shdr.sh_flags & SHF_ALLOC))
+          sec->resolve(ctx);
+      });
+    });
+  });
+
   // Create .bss sections for common symbols.
   convert_common_symbols(ctx);
 
@@ -584,8 +635,7 @@ int mold_main(int argc, char **argv) {
   // name is defined twice.
   check_symbol_version_conflicts(ctx);
 
-  // Compute the is_weak bit for each imported symbol.
-  compute_imported_symbol_weakness(ctx);
+  merge_arena.execute([&] { merge_task.wait(); });
 
   // Sort sections by section attributes so that we'll have to
   // create as few segments as possible.
